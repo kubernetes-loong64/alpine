@@ -1,0 +1,351 @@
+name: loong64
+
+on:
+  push:
+    branches:
+      - loong64-*
+    tags:
+      - release-loong64-*
+  pull_request:
+    branches:
+      - loong64-*
+
+env:
+  NAMESPACE: ${{ vars.NAMESPACE || 'kubernetesloong64' }}
+  ALPINE_MIRROR: ${{ vars.ALPINE_MIRROR || 'https://dl-cdn.alpinelinux.org/alpine' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      DOCKER_TAG: ${{ steps.extract.outputs.DOCKER_TAG }}
+      GIT_BRANCH: ${{ steps.extract.outputs.GIT_BRANCH }}
+      IS_STABLE: ${{ steps.extract.outputs.IS_STABLE }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          # Alpine arch (dl-cdn directory) -> Docker platform
+          - alpine_arch: x86_64
+            platform: linux/amd64
+          - alpine_arch: aarch64
+            platform: linux/arm64
+          - alpine_arch: armv7
+            platform: linux/arm/v7
+          - alpine_arch: armhf
+            platform: linux/arm/v6
+          - alpine_arch: x86
+            platform: linux/386
+          - alpine_arch: loongarch64
+            platform: linux/loong64
+          - alpine_arch: ppc64le
+            platform: linux/ppc64le
+          - alpine_arch: s390x
+            platform: linux/s390x
+          - alpine_arch: riscv64
+            platform: linux/riscv64
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Print branch name
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "${{ github.base_ref }} (PR target)"
+          else
+            echo ${{ github.ref_name }}
+          fi
+      - name: Extract git branch
+        id: extract
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            REF=${{ github.base_ref }}
+          else
+            REF=${{ github.ref_name }}
+          fi
+          echo "REF=$REF"
+          RAW_VERSION=$(echo $REF | awk -F'loong64-' '{print $2}')
+          echo "RAW_VERSION=$RAW_VERSION"
+          echo "RAW_VERSION=$RAW_VERSION" >> ${GITHUB_ENV}
+          GIT_BRANCH=$(echo $RAW_VERSION | awk -F'+' '{print $1}')
+          echo "GIT_BRANCH=$GIT_BRANCH"
+          echo "GIT_BRANCH=$GIT_BRANCH" >> ${GITHUB_ENV}
+          echo "GIT_BRANCH=$GIT_BRANCH" >> ${GITHUB_OUTPUT}
+          DOCKER_TAG=$(echo $RAW_VERSION | sed 's/+/-/g')
+          echo "DOCKER_TAG=$DOCKER_TAG"
+          echo "DOCKER_TAG=$DOCKER_TAG" >> ${GITHUB_ENV}
+          echo "DOCKER_TAG=$DOCKER_TAG" >> ${GITHUB_OUTPUT}
+          if echo "$RAW_VERSION" | grep -qE '[+].*(alpha|beta|rc)'; then
+            IS_STABLE=false
+          else
+            IS_STABLE=true
+          fi
+          echo "IS_STABLE=$IS_STABLE"
+          echo "IS_STABLE=$IS_STABLE" >> ${GITHUB_OUTPUT}
+      - name: Download Alpine minirootfs
+        id: minirootfs
+        run: |
+          set -eux
+          # Alpine publishes releases only per minor branch (e.g. v3.21),
+          # so v3.21.x style versions resolve to their minor branch directory.
+          # The directory always has the "v" prefix, while the branch name
+          # (e.g. loong64-3.21.0) may omit it.
+          ALPINE_DIR_NAME=$(echo "${GIT_BRANCH%%+*}" | sed -E 's/^v?([0-9]+\.[0-9]+).*/v\1/')
+          INDEX_URL="${ALPINE_MIRROR}/${ALPINE_DIR_NAME}/releases/${{ matrix.arch.alpine_arch }}/"
+          echo "=== Index: $INDEX_URL ==="
+          LISTING=$(curl -fsSL "$INDEX_URL")
+          # Prefer the exact patch version (branch loong64-v3.21.3 -> minirootfs 3.21.3),
+          # otherwise fall back to the latest minirootfs of the minor branch.
+          VER_NO_V=${GIT_BRANCH%%+*}
+          VER_NO_V=${VER_NO_V#v}
+          MINIROOTFS=$(echo "$LISTING" | grep -oE "alpine-minirootfs-${VER_NO_V//./\\.}-${{ matrix.arch.alpine_arch }}\.tar\.gz" | sort -uV | tail -1)
+          if [ -z "$MINIROOTFS" ]; then
+            MINIROOTFS=$(echo "$LISTING" | grep -oE "alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-${{ matrix.arch.alpine_arch }}\.tar\.gz" | sort -uV | tail -1)
+          fi
+          if [ -z "$MINIROOTFS" ]; then
+            echo "Failed to resolve alpine-minirootfs for ${{ matrix.arch.alpine_arch }} from $INDEX_URL" >&2
+            exit 1
+          fi
+          MINIROOTFS_VERSION=${MINIROOTFS#alpine-minirootfs-}
+          MINIROOTFS_VERSION=${MINIROOTFS_VERSION%%-*}
+          echo "MINIROOTFS=$MINIROOTFS"
+          echo "MINIROOTFS=$MINIROOTFS" >> ${GITHUB_ENV}
+          echo "MINIROOTFS_VERSION=$MINIROOTFS_VERSION"
+          echo "MINIROOTFS_VERSION=$MINIROOTFS_VERSION" >> ${GITHUB_ENV}
+          curl -fsSL -o "docker/$MINIROOTFS" "$INDEX_URL$MINIROOTFS"
+          curl -fsSL -o "docker/$MINIROOTFS.sha256" "$INDEX_URL$MINIROOTFS.sha256"
+          (
+            cd docker
+            sha256sum -c "$MINIROOTFS.sha256"
+          )
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: Build Docker image
+        run: |
+          IMAGE_REF=${NAMESPACE}/alpine:${DOCKER_TAG}-${{ matrix.arch.alpine_arch }}
+          TAR_FILE=alpine-${DOCKER_TAG}-${{ matrix.arch.alpine_arch }}.tar
+          echo "=== Before Docker build ==="
+          docker images
+          echo "=== Starting Docker build ==="
+          docker buildx build \
+            --no-cache \
+            -f "docker/Dockerfile" \
+            --load \
+            --build-arg "ALPINE_VERSION=${MINIROOTFS_VERSION}" \
+            --build-arg "MINIROOTFS_TARBALL=${MINIROOTFS}" \
+            --platform ${{ matrix.arch.platform }} \
+            -t "$IMAGE_REF" \
+            docker/
+          echo "=== After build ==="
+          docker images
+          echo "=== Saving $IMAGE_REF ==="
+          docker save -o "$TAR_FILE" "$IMAGE_REF"
+          echo "=== Image tarball ==="
+          ls -lha "$TAR_FILE"
+          echo "=== Manifest ==="
+          echo "--- repositories ---"
+          tar -xOf "$TAR_FILE" repositories
+          echo "--- manifest.json ---"
+          tar -xOf "$TAR_FILE" manifest.json | jq
+          echo "--- config ---"
+          tar -xOf "$TAR_FILE" $(tar -xOf "$TAR_FILE" manifest.json | jq -r '.[0].Config') | jq
+          echo "--- os, architecture, variant ---"
+          tar -xOf "$TAR_FILE" $(tar -xOf "$TAR_FILE" manifest.json | jq -r '.[0].Config') | jq '{os, architecture, variant}'
+          echo "=== Runtime verification ==="
+          docker run --rm --platform ${{ matrix.arch.platform }} "$IMAGE_REF" cat /etc/os-release
+      - name: Upload container image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: alpine-image-${{ matrix.arch.alpine_arch }}
+          path: alpine-*.tar
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
+      DOCKER_TAG: ${{ needs.build.outputs.DOCKER_TAG }}
+      GIT_BRANCH: ${{ needs.build.outputs.GIT_BRANCH }}
+      IS_STABLE: ${{ needs.build.outputs.IS_STABLE }}
+      ARCHES: x86_64 aarch64 armv7 armhf x86 loongarch64 ppc64le s390x riscv64
+    steps:
+      - name: Download container images
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: alpine-image-*
+          path: alpine-artifacts
+          merge-multiple: true
+      - name: List downloaded files
+        run: find . -type f
+      - name: Login to Docker
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ vars.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Load and push Docker images
+        run: |
+          echo "=== Loading images ==="
+          for tar in alpine-artifacts/alpine-*.tar; do
+            echo "=== Loading $tar ==="
+            docker load -i "$tar"
+          done
+          echo "=== After load ==="
+          docker images
+
+          for arch in $ARCHES; do
+            IMAGE_REF=${NAMESPACE}/alpine:${DOCKER_TAG}-${arch}
+            echo "=== Pushing $IMAGE_REF ==="
+            docker push $IMAGE_REF
+            if [ "${GIT_BRANCH}" != "${DOCKER_TAG}" ]; then
+              GIT_BRANCH_IMAGE_REF=${NAMESPACE}/alpine:${GIT_BRANCH}-${arch}
+              echo "=== Tagging and pushing $GIT_BRANCH_IMAGE_REF ==="
+              docker tag $IMAGE_REF $GIT_BRANCH_IMAGE_REF
+              docker push $GIT_BRANCH_IMAGE_REF
+            fi
+          done
+
+          echo "=== Creating multi-arch manifest ${NAMESPACE}/alpine:${DOCKER_TAG} ==="
+          docker buildx imagetools create \
+            -t ${NAMESPACE}/alpine:${DOCKER_TAG} \
+            $(for arch in $ARCHES; do echo "${NAMESPACE}/alpine:${DOCKER_TAG}-${arch}"; done)
+          if [ "${GIT_BRANCH}" != "${DOCKER_TAG}" ]; then
+            docker buildx imagetools create \
+              -t ${NAMESPACE}/alpine:${GIT_BRANCH} \
+              $(for arch in $ARCHES; do echo "${NAMESPACE}/alpine:${GIT_BRANCH}-${arch}"; done)
+          fi
+          echo "=== Manifest inspect ==="
+          docker buildx imagetools inspect ${NAMESPACE}/alpine:${DOCKER_TAG}
+
+          echo "=== Push complete ==="
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY_BASE64 }}" | base64 -d | gpg --batch --import > /dev/null
+          echo "$(gpg --list-secret-keys --keyid-format LONG | grep -Eo '[A-F0-9]{40}' | head -1):6:" | gpg --import-ownertrust
+      - name: Sign artifacts
+        run: |
+          find alpine-artifacts -type f | while read -r file; do
+            gpg --detach-sign --armor "$file"
+            echo "Signed: $file"
+            gpg --verify "$file".asc "$file"
+          done
+      - name: Generate release body
+        run: |
+          {
+            echo "## Artifacts"
+            echo ""
+            echo "| File | Download |"
+            echo "|------|----------|"
+            for tar in alpine-artifacts/alpine-*.tar; do
+              file=$(basename "$tar")
+              echo "| \`$file\` | [$file](${BASE_URL}/$file) |"
+            done
+            echo ""
+            echo "Each file has a corresponding \`.asc\` detached GPG signature."
+            echo ""
+            echo "## Docker image"
+            echo ""
+            echo "Multi-arch manifest list (amd64, arm64, arm/v7, arm/v6, 386, loong64, ppc64le, s390x, riscv64):"
+            echo ""
+            echo '```shell'
+            echo "docker pull ${NAMESPACE}/alpine:${DOCKER_TAG}"
+            echo '```'
+            echo ""
+            echo "Per-architecture tags:"
+            echo ""
+            echo '```'
+            for arch in $ARCHES; do
+              echo "${NAMESPACE}/alpine:${DOCKER_TAG}-${arch}"
+            done
+            echo '```'
+            echo ""
+            echo "Download and load the image:"
+            echo ""
+            for tar in alpine-artifacts/alpine-*.tar; do
+              file=$(basename "$tar")
+              echo '```shell'
+              echo "curl -LO ${BASE_URL}/$file"
+              echo "docker load -i $file"
+              echo '```'
+            done
+            echo ""
+            echo "## Verifying releases"
+            echo ""
+            echo '```shell'
+            echo "gpg --keyserver keys.openpgp.org --recv-keys FCF8724722CCBF9F51B1FBE376532BE7E3013105"
+            echo 'echo "FCF8724722CCBF9F51B1FBE376532BE7E3013105:6:" | gpg --import-ownertrust'
+            echo "gpg --verify <file>.asc <file>"
+            echo '```'
+          } > release-body.md
+          cat release-body.md
+      - name: Create Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release-body.md
+          prerelease: ${{ env.IS_STABLE == 'false' }}
+          make_latest: ${{ env.IS_STABLE == 'true' && 'legacy' || 'false' }}
+          files: |
+            alpine-artifacts/**
+
+  sync-registry:
+    if: startsWith(github.ref, 'refs/tags/') && vars.SYNC_REGISTRY != ''
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DOCKER_TAG: ${{ needs.build.outputs.DOCKER_TAG }}
+      GIT_BRANCH: ${{ needs.build.outputs.GIT_BRANCH }}
+      ARCHES: x86_64 aarch64 armv7 armhf x86 loongarch64 ppc64le s390x riscv64
+    steps:
+      - name: Download container images
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: alpine-image-*
+          path: alpine-artifacts
+          merge-multiple: true
+      - name: Load Docker images
+        run: |
+          for tar in alpine-artifacts/alpine-*.tar; do
+            echo "=== Loading $tar ==="
+            docker load -i "$tar"
+          done
+          echo "=== After load ==="
+          docker images
+      - name: Login to sync container registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ vars.SYNC_REGISTRY }}
+          username: ${{ vars.SYNC_REGISTRY_USERNAME }}
+          password: ${{ secrets.SYNC_REGISTRY_PASSWORD }}
+      - name: Sync Docker images to sync container registry
+        run: |
+          for arch in $ARCHES; do
+            IMAGE_REF=${NAMESPACE}/alpine:${DOCKER_TAG}-${arch}
+            SYNC_IMAGE_REF=${{ vars.SYNC_REGISTRY }}/${NAMESPACE}/alpine:${DOCKER_TAG}-${arch}
+            echo "=== Syncing $IMAGE_REF -> $SYNC_IMAGE_REF ==="
+            docker tag $IMAGE_REF $SYNC_IMAGE_REF
+            docker push $SYNC_IMAGE_REF
+            if [ "${GIT_BRANCH}" != "${DOCKER_TAG}" ]; then
+              SYNC_GIT_BRANCH_IMAGE_REF=${{ vars.SYNC_REGISTRY }}/${NAMESPACE}/alpine:${GIT_BRANCH}-${arch}
+              docker tag $IMAGE_REF $SYNC_GIT_BRANCH_IMAGE_REF
+              docker push $SYNC_GIT_BRANCH_IMAGE_REF
+            fi
+          done
+
+          echo "=== Creating multi-arch manifest on sync registry ==="
+          docker buildx imagetools create \
+            -t ${{ vars.SYNC_REGISTRY }}/${NAMESPACE}/alpine:${DOCKER_TAG} \
+            $(for arch in $ARCHES; do echo "${{ vars.SYNC_REGISTRY }}/${NAMESPACE}/alpine:${DOCKER_TAG}-${arch}"; done)
+          if [ "${GIT_BRANCH}" != "${DOCKER_TAG}" ]; then
+            docker buildx imagetools create \
+              -t ${{ vars.SYNC_REGISTRY }}/${NAMESPACE}/alpine:${GIT_BRANCH} \
+              $(for arch in $ARCHES; do echo "${{ vars.SYNC_REGISTRY }}/${NAMESPACE}/alpine:${GIT_BRANCH}-${arch}"; done)
+          fi
+          echo "=== Registry sync complete ==="
